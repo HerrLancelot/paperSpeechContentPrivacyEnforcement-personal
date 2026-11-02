@@ -399,7 +399,7 @@ def blurring_mfcc(audio, sr, n_mfcc=5):
     return audio_reconstructed
 
 class SourceSeparation:
-    def __init__(self, method="music", device="cpu"):
+    def __init__(self, method="music", device="cpu", ckpt_path=None):
         """
         Initialize the SourceSeparation class.
 
@@ -407,9 +407,18 @@ class SourceSeparation:
             method (str): The method to use for source separation. 
                             Options are "music" or "environmental".
         """
-        if method not in ["music", "env"]:
-            raise ValueError("Invalid method. Choose 'music' or 'env'.")
+        if method not in ["music", "env", "nbss"]:
+            raise ValueError("Invalid method. Choose 'music', 'env' or 'nbss'.")
         self.method = method
+        if method == "nbss":
+            # multichannel OnlineSpatialNet, expects [C, T] input at 16 kHz (see nbss_separator.py)
+            from nbss_separator import NBSSSeparator
+            if ckpt_path is None:
+                raise ValueError("method 'nbss' needs ckpt_path")
+            self.model = NBSSSeparator(ckpt_path, device=device)
+            self.sr = self.model.sr
+            self.device = device
+            return
         if method == "music":
             bundle = HDEMUCS_HIGH_MUSDB_PLUS if method == "music" else CONVTASNET_BASE_LIBRI2MIX
             self.model = bundle.get_model()
@@ -435,6 +444,9 @@ class SourceSeparation:
         Returns:
             dict: A dictionary containing separated sources.
         """
+        if self.method == "nbss":
+            return self.model.separate(audio)  # audio: [C, T] at self.sr
+
         if self.method == "music":
 
             waveform = torch.tensor(audio, dtype=torch.float32).repeat(2, 1).to(self.device)
@@ -609,8 +621,13 @@ def blur_audio(y, sr, segmin, segmax, framemin, seghopmin_perc=0.95, seghopmax_p
     reverse: "random", "forward", "backward"
     """
 
+    # multichannel input [C, T] (nbss): the rest of the pipeline works on reference channel 0
+    y_mc = None
+    if y.ndim == 2:
+        y_mc, y = y, y[0].copy()
+
     if source_sep is not None:
-        y_voice, y_other = source_sep.separate(y, sr)
+        y_voice, y_other = source_sep.separate(y_mc if y_mc is not None else y, sr)
     else:
         y_voice = y.copy()
         y_other = np.zeros_like(y)

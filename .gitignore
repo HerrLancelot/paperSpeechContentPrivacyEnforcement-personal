@@ -9,3 +9,5 @@ embs/.model-checkpoints/
 TEST/
 TEST_dataset/
 pretrained_models/
+__pycache__/
+*.pyc

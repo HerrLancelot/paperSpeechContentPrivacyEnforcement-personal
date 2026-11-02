@@ -29,7 +29,7 @@ def anonymize_audio(args):
     force_cpu = False
     device = torch.device("cpu") if force_cpu else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    source_sep = SourceSeparation(args.sep_method, device=device) if do_sep else None
+    source_sep = SourceSeparation(args.sep_method, device=device, ckpt_path=args.ckpt) if do_sep else None
 
     ###########################################
     ###### BEATS loading
@@ -98,9 +98,15 @@ def anonymize_audio(args):
                     with sf.SoundFile(output_path, mode='w', samplerate=sr, channels=1) as output_file:
                         while sf_file.tell() < len(sf_file):
                             chunk = sf_file.read(int(batch_duration * original_sr), dtype='float32')
-                            if sf_file.channels > 1:
-                                chunk = np.mean(chunk, axis=1)
-                            resampled_chunk = librosa.resample(chunk, orig_sr=original_sr, target_sr=sr)
+                            if do_sep and args.sep_method == "nbss":
+                                # keep all channels: [T, C] -> [C, T], resample every channel
+                                if chunk.ndim == 1:
+                                    chunk = chunk[:, None]
+                                resampled_chunk = librosa.resample(chunk.T, orig_sr=original_sr, target_sr=sr, axis=-1)
+                            else:
+                                if sf_file.channels > 1:
+                                    chunk = np.mean(chunk, axis=1)
+                                resampled_chunk = librosa.resample(chunk, orig_sr=original_sr, target_sr=sr)
                             processed_chunk = blur_audio(resampled_chunk, sr, segmin, 
                                                                           segmax, framemin, seghopmin_perc=seghopmin_perc, 
                                                                           seghopmax_perc=seghopmax_perc, framehopmin_perc=framehopmin_perc,
@@ -154,10 +160,15 @@ if __name__ == "__main__":
     parser.add_argument('-reverse', '--reverse', type=str, default="backward", choices=["backward", "forward", "random"], help="Reverse direction. Defaults to 'backward'.")
     parser.add_argument('-method', '--method', type=str, default="random_splicing_reverse", choices=["random_splicing_reverse", "mfcc"], help="Anonymization method. Defaults to 'reverse'.")
     parser.add_argument('-sep', '--do_sep', type=str2bool, default=True, help="Enable source separation. Use True or False.")
-    parser.add_argument('-sepmethod', '--sep_method', type=str, default="music", choices=["music", "env"], help="Source separation method. Defaults to 'music'.")
+    parser.add_argument('-sepmethod', '--sep_method', type=str, default="music", choices=["music", "env", "nbss"], help="Source separation method. Defaults to 'music'.")
+    parser.add_argument('-ckpt', '--ckpt', type=str, default=None, help="Checkpoint (.ckpt) for --sep_method nbss.")
     args = parser.parse_args()
 
     anonymize_audio(args)
+    
+    import torch
+    if torch.cuda.is_available():
+        print(f"Peak GPU-Speicher: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
 
     # .010, 0.8
 
