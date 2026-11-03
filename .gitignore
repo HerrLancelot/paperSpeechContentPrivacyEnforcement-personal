@@ -11,3 +11,4 @@ TEST_dataset/
 pretrained_models/
 __pycache__/
 *.pyc
+audio/
