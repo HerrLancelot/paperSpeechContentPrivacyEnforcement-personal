@@ -6,7 +6,10 @@ from torchaudio.pipelines import HDEMUCS_HIGH_MUSDB_PLUS, CONVTASNET_BASE_LIBRI2
 import random 
 import torchaudio
 from utils.random_splicing import random_splicing
-from speechbrain.inference.interfaces import Pretrained
+try:
+    from speechbrain.inference.interfaces import Pretrained
+except ImportError:          # nur fuer method='env' (SepformerSeparation) noetig
+    Pretrained = object
 import torch.nn.functional as F
 
 class RandomAudioChunks():

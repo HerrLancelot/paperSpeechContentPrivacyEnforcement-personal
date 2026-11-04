@@ -9,8 +9,9 @@ Gemessen wird (Kriterium: Verarbeitung pro Block < Blockdauer, Puffer laeuft nic
   Sample des Blocks, Eingabe-Ueberlaeufe der Soundkarte (status-Meldungen von PortAudio).
 
   python live_anonymize.py --list-devices
-  python live_anonymize.py --ckpt nbss/ckpts/epoch70_metric23.9507.ckpt --input-device ReSpeaker \
-        --channels 4 --seconds 120 --out live_out.wav --json live_rtf.json
+  python live_anonymize.py --ckpt nbss/ckpts/epoch70_metric23.9507.ckpt \
+        --input-device "reSpeaker XVF3800" --hostapi WDM-KS --channels 6 --use-channels 4,3,2,5 \
+        --device cpu --seconds 30 --out live_out.wav --json live_rtf.json   # oder --input-device <Index>
 Benoetigt: pip install sounddevice   (PortAudio; unter Linux ggf. libportaudio2)
 """
 import argparse
@@ -30,14 +31,40 @@ import anonymizer
 from stream_anonymizer import StreamAnonymizer
 
 
+class DummySep:
+    """Platzhalter ohne Modell (nur Funktionstest der Live-Kette): Sprache = Kanal 0, Hintergrund = 0."""
+    sr, N_CHN, use_bf16 = 16000, 4, False
+
+    def separate(self, x):
+        return x[0].copy(), np.zeros_like(x[0])
+
+
+def list_inputs(sd):
+    """(Index, Name, Host-API, max. Eingangskanaele) aller Eingabegeraete."""
+    return [(i, d["name"], sd.query_hostapis(d["hostapi"])["name"], d["max_input_channels"])
+            for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0]
+
+
+def pick_device(sd, name, hostapi, min_channels):
+    """Erstes Eingabegeraet mit Namensteil, passender Host-API und genug Kanaelen (wie im Mikrotest)."""
+    for i, n, h, c in list_inputs(sd):
+        if name.lower() in n.lower() and (not hostapi or hostapi.lower() in h.lower()) and c >= min_channels:
+            return i
+    raise SystemExit(f"Kein Eingabegeraet mit '{name}' / Host-API '{hostapi}' / >= {min_channels} Kanaelen "
+                     f"gefunden. Siehe --list-devices.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--ckpt")
-    ap.add_argument("--input-device", default=None, help="Index oder Namensteil, z. B. ReSpeaker")
-    ap.add_argument("--channels", type=int, default=6, help="Kanaele, die das Geraet liefert")
-    ap.add_argument("--use-channels", default="4,3,2,5", help="Kommagetrennte Geraetekanaele fuer das Modell (4 Stueck, "
-                    "Reihenfolge wie im Training, Referenz = erster")
+    ap.add_argument("--dummy-sep", action="store_true",
+                    help="ohne NBSS (Sprache = Kanal 0): prueft nur Mikrofon, Queue, Bloecke, BEATs, Splicing, wav")
+    ap.add_argument("--input-device", default=None, help="Geraeteindex oder Namensteil, z. B. 'reSpeaker XVF3800'")
+    ap.add_argument("--hostapi", default=None, help="Host-API-Filter bei Namenssuche, z. B. 'WDM-KS' (Windows)")
+    ap.add_argument("--channels", type=int, default=4, help="Kanaele, die das Geraet liefert")
+    ap.add_argument("--use-channels", default=None, help="Kommagetrennte Geraetekanaele fuer das Modell (4 Stueck, "
+                    "Reihenfolge wie im Training, Referenz = erster), Standard 0,1,2,3")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--fp32", action="store_true")
     ap.add_argument("--block", type=float, default=2.0)
@@ -64,13 +91,15 @@ def main():
 
     import sounddevice as sd
     if args.list_devices:
-        print(sd.query_devices())
+        print(f"{'Idx':>3}  {'Kan.':>4}  {'Host-API':<22} Name")
+        for i, n, h, c in list_inputs(sd):
+            print(f"{i:>3}  {c:>4}  {h:<22} {n}")
         return
-    if not args.ckpt:
-        raise SystemExit("--ckpt fehlt")
+    if not args.ckpt and not args.dummy_sep:
+        raise SystemExit("--ckpt fehlt (oder --dummy-sep)")
 
     dev = torch.device(args.device)
-    sep = NBSSSeparator(args.ckpt, device=args.device, use_bf16=not args.fp32, seg=None)
+    sep = DummySep() if args.dummy_sep else NBSSSeparator(args.ckpt, device=args.device, use_bf16=not args.fp32, seg=None)
     sr = sep.sr
     beats, speech_idx = load_beats(args.beats_ckpt, args.ontology, dev)
     vad = TimedVAD(beats, dev)
@@ -102,7 +131,16 @@ def main():
     anon = StreamAnonymizer(sep, kw, blur_fn=anonymizer.blur_audio, block_s=args.block, ctx_s=args.ctx)
     use = [int(c) for c in args.use_channels.split(",")] if args.use_channels else list(range(sep.N_CHN))
     assert len(use) == sep.N_CHN and max(use) < args.channels, (use, args.channels)
-    dev_in = int(args.input_device) if (args.input_device or "").isdigit() else args.input_device
+    if args.input_device is None:
+        dev_in = None                                     # Standardgeraet
+    elif args.input_device.isdigit():
+        dev_in = int(args.input_device)
+    else:
+        dev_in = pick_device(sd, args.input_device, args.hostapi, args.channels)
+    if dev_in is not None:
+        d = sd.query_devices(dev_in)
+        print(f"Eingabegeraet {dev_in}: {d['name']} ({sd.query_hostapis(d['hostapi'])['name']}, "
+              f"{d['max_input_channels']} Kanaele)")
 
     q = queue.Queue()
     events = []
@@ -115,7 +153,7 @@ def main():
     rows, backlog_max = [], 0.0
     dur = anon.block_seconds
     print(f"Block={anon.block} Samples = {dur:.3f} s, Kontext={args.ctx} s, Chunk={args.chunk} Samples "
-          f"({1000 * args.chunk / sr:.0f} ms), NBSS={'fp32' if args.fp32 else 'bf16'}, Kanaele {use}")
+          f"({1000 * args.chunk / sr:.0f} ms), NBSS={'DUMMY (kein Modell)' if args.dummy_sep else 'bf16' if sep.use_bf16 else 'fp32'}, Kanaele {use}")
     print(f"Aufnahme {args.seconds:.0f} s ... (Strg+C beendet frueher)")
     out = sf.SoundFile(args.out, "w", samplerate=sr, channels=1)
     stream = sd.InputStream(device=dev_in, channels=args.channels, samplerate=sr, dtype="float32",

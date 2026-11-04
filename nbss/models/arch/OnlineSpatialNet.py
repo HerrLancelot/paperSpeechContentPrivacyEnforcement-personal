@@ -15,8 +15,10 @@ from models.arch.base.retention import MultiScaleRetention, RetNetRelPos
 try:
     from mamba_ssm import Mamba
     from mamba_ssm.utils.generation import InferenceParams
-except:
-    Mamba = None
+except Exception:
+    class Mamba:            # Platzhalter: bei attention="ret(...)" nie benutzt
+        pass
+    InferenceParams = None
 
 
 class CausalConv1d(nn.Conv1d):

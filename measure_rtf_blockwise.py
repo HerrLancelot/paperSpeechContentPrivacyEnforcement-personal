@@ -125,7 +125,7 @@ def main():
         x = np.tile(x, (1, int(np.ceil(args.seconds * sr / x.shape[1]))))
     x = x[:, :int(args.seconds * sr)]
     print(f"Geraet={dev}, Eingang {x.shape[1] / sr:.1f} s, Block={anon.block} Samples = {anon.block_seconds:.3f} s "
-          f"(Raster), Kontext={args.ctx} s, NBSS-Praezision={'fp32' if args.fp32 else 'bf16'}")
+          f"(Raster), Kontext={args.ctx} s, NBSS-Praezision={'bf16' if sep.use_bf16 else 'fp32'}")
 
     rows, outs = [], []
     if dev.type == "cuda":
