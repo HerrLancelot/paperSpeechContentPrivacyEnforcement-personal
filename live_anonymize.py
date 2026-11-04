@@ -35,9 +35,9 @@ def main():
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--ckpt")
     ap.add_argument("--input-device", default=None, help="Index oder Namensteil, z. B. ReSpeaker")
-    ap.add_argument("--channels", type=int, default=4, help="Kanaele, die das Geraet liefert")
-    ap.add_argument("--use-channels", default=None, help="Kommagetrennte Geraetekanaele fuer das Modell (4 Stueck, "
-                    "Reihenfolge wie im Training, Referenz = erster), Standard 0,1,2,3")
+    ap.add_argument("--channels", type=int, default=6, help="Kanaele, die das Geraet liefert")
+    ap.add_argument("--use-channels", default="4,3,2,5", help="Kommagetrennte Geraetekanaele fuer das Modell (4 Stueck, "
+                    "Reihenfolge wie im Training, Referenz = erster")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--fp32", action="store_true")
     ap.add_argument("--block", type=float, default=2.0)

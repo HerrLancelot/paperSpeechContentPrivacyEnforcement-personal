@@ -2,8 +2,9 @@
 """
 Nutzwert-Auswertung (bleiben die Umgebungsgeraeusche erhalten?) fuer die Anonymisierungspipeline.
 
-1) FAD wie im Paper: PANNs wavegram-logmel (Modellklasse aus embs/model_loader.py), Frame-Embeddings
-   aller Dateien einer Variante gepoolt, Frechet-Distanz zwischen den Verteilungen.
+1) FAD wie im Paper: PANNs wavegram-logmel (Modellklasse aus embs/model_loader.py). Pro Clip entsteht EIN
+   Embedding (der Wrapper mittelt 10 ueberlappende, aufgefuellte 10-s-Fenster); Frechet-Distanz zwischen den
+   Verteilungen dieser Clip-Embeddings (N = Anzahl Clips, D = 2048, Kovarianz hat Rang <= N-1).
    Referenzen: oracle (Originalmischung, wie im Paper) UND background (reines Background-Target).
    utils/fad.py wird NICHT importiert (braucht hypy_utils und `from scipy import sqrt`, das es in
    aktuellem SciPy nicht mehr gibt); die Frechet-Distanz ist hier mathematisch dieselbe, aber stabiler berechnet.
@@ -156,7 +157,7 @@ def main():
                     np.save(f, panns.get_embedding(y))
                 embs.append(np.load(f))
             frames[v] = np.concatenate(embs).astype(np.float64)
-            print(f"[FAD] {v}: {frames[v].shape[0]} Frames", flush=True)
+            print(f"[FAD] {v}: {frames[v].shape[0]} Clip-Embeddings a {frames[v].shape[1]} Dimensionen", flush=True)
         st = {v: stats(x) for v, x in frames.items()}
         fad = {}
         for ref in ("oracle", "background"):
