@@ -99,8 +99,10 @@ def main():
         raise SystemExit("--ckpt fehlt (oder --dummy-sep)")
 
     dev = torch.device(args.device)
+    print("Lade Modell ..." if not args.dummy_sep else "Dummy-Separator (kein Modell)", flush=True)
     sep = DummySep() if args.dummy_sep else NBSSSeparator(args.ckpt, device=args.device, use_bf16=not args.fp32, seg=None)
     sr = sep.sr
+    print("Lade BEATs ...", flush=True)
     beats, speech_idx = load_beats(args.beats_ckpt, args.ontology, dev)
     vad = TimedVAD(beats, dev)
 
@@ -120,10 +122,13 @@ def main():
               vad_speech_index=speech_idx, vad_speech_ths=args.speech_ths, method=args.method)
 
     # Warm-up (CUDA-Init, Kernel-Auswahl) mit Rauschen, getrennte Instanz, damit der Live-Strom unberuehrt bleibt
+    print("Warm-up (3 Bloecke mit Rauschen) ...", flush=True)
+    t_w = time.perf_counter()
     warm = StreamAnonymizer(sep, kw, blur_fn=anonymizer.blur_audio, block_s=args.block, ctx_s=args.ctx)
     rng = np.random.default_rng(0)
-    for _ in range(3):
+    for i in range(3):
         warm.push(0.01 * rng.standard_normal((sep.N_CHN, warm.block)).astype(np.float32))
+        print(f"  Warm-up Block {i + 1}/3 fertig ({time.perf_counter() - t_w:.1f} s)", flush=True)
     vad.t.clear()
     t_splice.clear()
     del warm
@@ -154,7 +159,7 @@ def main():
     dur = anon.block_seconds
     print(f"Block={anon.block} Samples = {dur:.3f} s, Kontext={args.ctx} s, Chunk={args.chunk} Samples "
           f"({1000 * args.chunk / sr:.0f} ms), NBSS={'DUMMY (kein Modell)' if args.dummy_sep else 'bf16' if sep.use_bf16 else 'fp32'}, Kanaele {use}")
-    print(f"Aufnahme {args.seconds:.0f} s ... (Strg+C beendet frueher)")
+    print(f"Aufnahme {args.seconds:.0f} s ... (Strg+C beendet frueher)", flush=True)
     out = sf.SoundFile(args.out, "w", samplerate=sr, channels=1)
     stream = sd.InputStream(device=dev_in, channels=args.channels, samplerate=sr, dtype="float32",
                             blocksize=args.chunk, callback=callback)
@@ -162,11 +167,16 @@ def main():
     try:
         with stream:
             t_stop = time.monotonic() + args.seconds
+            n_chunks, t_print = 0, time.monotonic()
             while time.monotonic() < t_stop:
                 try:
                     t_arr, chunk = q.get(timeout=1.0)
                 except queue.Empty:
+                    if time.monotonic() - t_print > 5:
+                        print(f"  ... {n_chunks * args.chunk / sr:.1f} s Audio empfangen (kommt Audio vom Mikrofon an?)", flush=True)
+                        t_print = time.monotonic()
                     continue
+                n_chunks += 1
                 backlog = q.qsize() * args.chunk / sr
                 backlog_max = max(backlog_max, backlog)
                 i_vad, i_spl = len(vad.t), len(t_splice)
@@ -177,6 +187,12 @@ def main():
                     tb, ts = sum(vad.t[i_vad:]), sum(t_splice[i_spl:])
                     rows.append(dict(total=tot, nbss=tsep, beats=tb, splice=ts, rest=tot - tsep - tb - ts,
                                      latency=time.monotonic() - t_arr, backlog=backlog))
+                    print(f"  Block {len(rows)}: Rechenzeit {tot:.2f} s (RTF {tot / dur:.2f}), Backlog {backlog:.1f} s, "
+                          f"{len(rows) * dur:.1f} s ausgegeben", flush=True)
+                    t_print = time.monotonic()
+                if time.monotonic() - t_print > 5:
+                    print(f"  ... {n_chunks * args.chunk / sr:.1f} s Audio empfangen, Backlog {backlog:.1f} s", flush=True)
+                    t_print = time.monotonic()
                 if backlog > args.max_backlog:
                     print(f"[!] Backlog {backlog:.1f} s > {args.max_backlog} s: Verarbeitung ist langsamer als Echtzeit")
                     break
