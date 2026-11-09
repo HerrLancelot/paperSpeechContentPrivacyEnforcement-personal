@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(HERE, "beats"))
 from BEATs import BEATs, BEATsConfig                # noqa: E402
 import anonymizer                                   # noqa: E402
 from stream_anonymizer import StreamAnonymizer      # noqa: E402
+from stream_anonymizer_mc import StreamAnonymizerMC  # noqa: E402
 
 
 def sync(dev):
@@ -70,6 +71,10 @@ def main():
     ap.add_argument("--wav", required=True)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--fp32", action="store_true", help="NBSS in fp32 statt bf16-Autocast")
+    ap.add_argument("--arch", choices=["retention", "mamba"], default="retention", help="Modellvariante des Checkpoints")
+    ap.add_argument("--mc-out", action="store_true", help="Mehrkanal-Ausgabe (4 Kanaele, 4 gerollte NBSS-Laeufe je Block)")
+    ap.add_argument("--batch-roll", action="store_true", help="mit --mc-out: die 4 Rollungen als ein Batch")
+    ap.add_argument("--vad-mode", choices=["ref", "any"], default="ref", help="mit --mc-out: VAD nur Kanal 0 oder ODER ueber alle")
     ap.add_argument("--block", type=float, default=2.0, help="gewuenschte Blocklaenge in s (wird auf BEATs-Raster gerundet)")
     ap.add_argument("--ctx", type=float, default=2.0, help="Links-Kontext fuer NBSS in s")
     ap.add_argument("--input-chunk", type=int, default=1024, help="Samples je simuliertem Mikro-Callback")
@@ -94,7 +99,7 @@ def main():
     args = ap.parse_args()
 
     dev = torch.device(args.device)
-    sep = NBSSSeparator(args.ckpt, device=args.device, use_bf16=not args.fp32, seg=None)
+    sep = NBSSSeparator(args.ckpt, device=args.device, use_bf16=not args.fp32, seg=None, arch=args.arch)
     sr = sep.sr
     beats, speech_idx = load_beats(args.beats_ckpt, args.ontology, dev)
     vad = TimedVAD(beats, dev)
@@ -115,7 +120,11 @@ def main():
               framehopmin_perc=args.framehopmin, mixframe=bool(args.mixframe), reverse=args.reverse,
               device=dev, vad_model=vad, vad_sr=16000, vad_speech_index=speech_idx,
               vad_speech_ths=args.speech_ths, method=args.method)
-    anon = StreamAnonymizer(sep, kw, blur_fn=anonymizer.blur_audio, block_s=args.block, ctx_s=args.ctx)
+    if args.mc_out:
+        anon = StreamAnonymizerMC(sep, kw, block_s=args.block, ctx_s=args.ctx, batch_roll=args.batch_roll,
+                                  vad_mode=args.vad_mode)
+    else:
+        anon = StreamAnonymizer(sep, kw, blur_fn=anonymizer.blur_audio, block_s=args.block, ctx_s=args.ctx)
     assert args.input_chunk <= anon.block
 
     x, fs = sf.read(args.wav, dtype="float32", always_2d=True)
@@ -125,7 +134,8 @@ def main():
         x = np.tile(x, (1, int(np.ceil(args.seconds * sr / x.shape[1]))))
     x = x[:, :int(args.seconds * sr)]
     print(f"Geraet={dev}, Eingang {x.shape[1] / sr:.1f} s, Block={anon.block} Samples = {anon.block_seconds:.3f} s "
-          f"(Raster), Kontext={args.ctx} s, NBSS-Praezision={'bf16' if sep.use_bf16 else 'fp32'}")
+          f"(Raster), Kontext={args.ctx} s, NBSS-Praezision={'bf16' if sep.use_bf16 else 'fp32'}, arch={args.arch}, "
+          f"Ausgabe={'4 Kanaele' if args.mc_out else 'mono'}")
 
     rows, outs = [], []
     if dev.type == "cuda":
@@ -158,7 +168,8 @@ def main():
     print(f"  im Puffer verbleibend (nie ausgegeben): {anon.pending_seconds:.2f} s")
 
     if args.out:
-        sf.write(args.out, np.concatenate(outs), sr)
+        y_out = np.concatenate(outs, axis=-1)
+        sf.write(args.out, y_out.T if y_out.ndim == 2 else y_out, sr)
         print(f"Ausgabe: {args.out}")
     if args.json:
         with open(args.json, "w") as f:

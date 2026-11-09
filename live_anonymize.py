@@ -29,6 +29,7 @@ from measure_rtf_blockwise import HERE, TimedVAD, load_beats, stats   # importie
 from nbss_separator import NBSSSeparator
 import anonymizer
 from stream_anonymizer import StreamAnonymizer
+from stream_anonymizer_mc import StreamAnonymizerMC
 
 
 class DummySep:
@@ -67,6 +68,10 @@ def main():
                     "Reihenfolge wie im Training, Referenz = erster), Standard 0,1,2,3")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--fp32", action="store_true")
+    ap.add_argument("--arch", choices=["retention", "mamba"], default="retention", help="Modellvariante des Checkpoints (mamba nur Linux)")
+    ap.add_argument("--mc-out", action="store_true", help="Mehrkanal-Ausgabe (4-Kanal-wav, 4 gerollte NBSS-Laeufe je Block)")
+    ap.add_argument("--batch-roll", action="store_true", help="mit --mc-out: die 4 Rollungen als ein Batch")
+    ap.add_argument("--vad-mode", choices=["ref", "any"], default="ref", help="mit --mc-out: VAD nur Kanal 0 oder ODER ueber alle")
     ap.add_argument("--block", type=float, default=2.0)
     ap.add_argument("--ctx", type=float, default=2.0)
     ap.add_argument("--chunk", type=int, default=1024, help="Samples je Mikrofon-Callback")
@@ -100,7 +105,7 @@ def main():
 
     dev = torch.device(args.device)
     print("Lade Modell ..." if not args.dummy_sep else "Dummy-Separator (kein Modell)", flush=True)
-    sep = DummySep() if args.dummy_sep else NBSSSeparator(args.ckpt, device=args.device, use_bf16=not args.fp32, seg=None)
+    sep = DummySep() if args.dummy_sep else NBSSSeparator(args.ckpt, device=args.device, use_bf16=not args.fp32, seg=None, arch=args.arch)
     sr = sep.sr
     print("Lade BEATs ...", flush=True)
     beats, speech_idx = load_beats(args.beats_ckpt, args.ontology, dev)
@@ -124,7 +129,13 @@ def main():
     # Warm-up (CUDA-Init, Kernel-Auswahl) mit Rauschen, getrennte Instanz, damit der Live-Strom unberuehrt bleibt
     print("Warm-up (3 Bloecke mit Rauschen) ...", flush=True)
     t_w = time.perf_counter()
-    warm = StreamAnonymizer(sep, kw, blur_fn=anonymizer.blur_audio, block_s=args.block, ctx_s=args.ctx)
+    def make_anon():
+        if args.mc_out:
+            return StreamAnonymizerMC(sep, kw, block_s=args.block, ctx_s=args.ctx, batch_roll=args.batch_roll,
+                                      vad_mode=args.vad_mode)
+        return StreamAnonymizer(sep, kw, blur_fn=anonymizer.blur_audio, block_s=args.block, ctx_s=args.ctx)
+
+    warm = make_anon()
     rng = np.random.default_rng(0)
     for i in range(3):
         warm.push(0.01 * rng.standard_normal((sep.N_CHN, warm.block)).astype(np.float32))
@@ -133,7 +144,7 @@ def main():
     t_splice.clear()
     del warm
 
-    anon = StreamAnonymizer(sep, kw, blur_fn=anonymizer.blur_audio, block_s=args.block, ctx_s=args.ctx)
+    anon = make_anon()
     use = [int(c) for c in args.use_channels.split(",")] if args.use_channels else list(range(sep.N_CHN))
     assert len(use) == sep.N_CHN and max(use) < args.channels, (use, args.channels)
     if args.input_device is None:
@@ -158,9 +169,10 @@ def main():
     rows, backlog_max = [], 0.0
     dur = anon.block_seconds
     print(f"Block={anon.block} Samples = {dur:.3f} s, Kontext={args.ctx} s, Chunk={args.chunk} Samples "
-          f"({1000 * args.chunk / sr:.0f} ms), NBSS={'DUMMY (kein Modell)' if args.dummy_sep else 'bf16' if sep.use_bf16 else 'fp32'}, Kanaele {use}")
+          f"({1000 * args.chunk / sr:.0f} ms), NBSS={'DUMMY (kein Modell)' if args.dummy_sep else 'bf16' if sep.use_bf16 else 'fp32'}, arch={args.arch}, "
+          f"Ausgabe={'4 Kanaele' if args.mc_out else 'mono'}, Kanaele {use}")
     print(f"Aufnahme {args.seconds:.0f} s ... (Strg+C beendet frueher)", flush=True)
-    out = sf.SoundFile(args.out, "w", samplerate=sr, channels=1)
+    out = sf.SoundFile(args.out, "w", samplerate=sr, channels=sep.N_CHN if args.mc_out else 1)
     stream = sd.InputStream(device=dev_in, channels=args.channels, samplerate=sr, dtype="float32",
                             blocksize=args.chunk, callback=callback)
     t_stop = None
@@ -182,7 +194,7 @@ def main():
                 i_vad, i_spl = len(vad.t), len(t_splice)
                 res = anon.push(chunk)
                 for y in res:
-                    out.write(y)
+                    out.write(y.T if y.ndim == 2 else y)
                     tot, tsep = anon.t_block[-1], anon.ctxsep.t_sep[-1]
                     tb, ts = sum(vad.t[i_vad:]), sum(t_splice[i_spl:])
                     rows.append(dict(total=tot, nbss=tsep, beats=tb, splice=ts, rest=tot - tsep - tb - ts,

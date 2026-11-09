@@ -81,9 +81,13 @@ def main(a):
 
         speech = np.zeros_like(mix)
         bg = np.zeros_like(mix)
-        for c in range(4):
-            s, b = sep.separate(np.roll(mix, -c, axis=0))
-            speech[c, :T], bg[c, :T] = s[:T], b[:T]
+        if a.batch_roll:
+            s, b = sep.separate_batch(np.stack([np.roll(mix, -c, axis=0) for c in range(4)]))
+            speech[:, :T], bg[:, :T] = s[:, :T], b[:, :T]
+        else:
+            for c in range(4):
+                s, b = sep.separate(np.roll(mix, -c, axis=0))
+                speech[c, :T], bg[c, :T] = s[:T], b[:T]
 
         for c in range(4):
             r = dict(file=os.path.basename(mf), ch=c,
@@ -130,5 +134,6 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--win", type=float, default=1.0, help="Fensterlaenge GCC-PHAT in s")
     p.add_argument("--max-lag", type=int, default=8, help="max. Lag in Samples (Arraygroesse beachten)")
+    p.add_argument("--batch-roll", action="store_true", help="Rollungen als Batch (benoetigt separate_batch)")
     p.add_argument("--gpu-frac", type=float, default=0.25)
     main(p.parse_args())

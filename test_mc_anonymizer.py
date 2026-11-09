@@ -72,6 +72,8 @@ def run(voice4, other4, **kw):
         raise AssertionError("unbekannte Rollung")
 
     kw.setdefault("tail_mode", "last_window")
+    if kw.pop("use_batch", False):
+        kw["sep_batch"] = lambda xs: tuple(np.stack(z) for z in zip(*[sep(x) for x in xs]))
     return blur_audio_mc(mix, SR, sep_ref0=sep, vad_model=None, **PARAMS, **kw)
 
 
@@ -119,7 +121,18 @@ def test_tdoa_under_reversal():
     print("OK  Reversal spiegelt den TDOA der Sprache (Vorzeichenwechsel), forward erhaelt ihn")
 
 
+def test_batch_equals_sequential():
+    v = synth_voice(seed=3)
+    voice4 = np.stack([v, np.roll(v, 2), 0.7 * v, np.roll(v, -1)])
+    other4 = 0.01 * np.random.RandomState(0).randn(*voice4.shape).astype(np.float32)
+    a, _ = run(voice4, other4, mixframe=True, reverse="backward", seed=9)
+    b, _ = run(voice4, other4, mixframe=True, reverse="backward", seed=9, use_batch=True)
+    assert np.array_equal(a, b)
+    print("OK  Batch-Pfad == sequentieller Pfad (Verdrahtung)")
+
+
 if __name__ == "__main__":
+    test_batch_equals_sequential()
     test_mono_equivalence()
     test_shared_plan_gain()
     test_tdoa_under_reversal()

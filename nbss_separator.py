@@ -27,10 +27,14 @@ class NBSSSeparator:
     SPEECH_IDX = 0
     BG_IDX = 1
 
-    def __init__(self, ckpt_path, device="cpu", use_bf16=True, seg=20.0, ctx=2.0):
+    # attention settings of the two trained variants (everything else in the config is identical)
+    ATTENTION = {"retention": "ret(2)", "mamba": "mamba(16,4)"}
+
+    def __init__(self, ckpt_path, device="cpu", use_bf16=True, seg=20.0, ctx=2.0, arch="retention"):
         """
         Args:
             ckpt_path: Lightning checkpoint (.ckpt) of the training run
+            arch:      "retention" (attention ret(2)) or "mamba" (attention mamba(16,4), needs mamba_ssm, Linux)
             use_bf16:  run the network under bf16 autocast like the training (precision: bf16-mixed)
             seg:       chunk length in s for long files (None = whole file at once)
             ctx:       left context in s that is processed but discarded (model is causal)
@@ -45,7 +49,7 @@ class NBSSSeparator:
             encoder_kernel_size=5, dim_hidden=96, dim_ffn=192, num_heads=4,
             dropout=(0.0, 0.0, 0.0), kernel_size=(5, 3), conv_groups=(8, 8),
             norms=["LN", "LN", "GN", "LN", "LN", "LN"], padding="zeros", full_share=0,
-            attention="ret(2)", decay=[4, 5, 9, 10], chunkwise_recurrent=True, rope=False,
+            attention=self.ATTENTION[arch], decay=[4, 5, 9, 10], chunkwise_recurrent=True, rope=False,
         )
         self.stft = STFT(n_fft=512, n_hop=256, win_len=512, win="hann_window")
         self.norm = Norm(mode="utterance", online=True)
@@ -56,7 +60,10 @@ class NBSSSeparator:
             k = k.replace("_orig_mod.", "")          # training used compile: true
             if k.startswith("arch."):
                 sd[k[len("arch."):]] = v
-        self.arch.load_state_dict(sd, strict=True)   # raises if config and checkpoint differ
+        try:
+            self.arch.load_state_dict(sd, strict=True)   # raises if config and checkpoint differ
+        except RuntimeError as e:
+            raise RuntimeError(f"Checkpoint passt nicht zu arch='{arch}' (retention/mamba verwechselt?): {e}") from e
 
         for m in (self.arch, self.stft, self.norm):
             m.eval().to(self.device)
@@ -93,6 +100,26 @@ class NBSSSeparator:
         y = y.cpu().numpy()
         return y[self.SPEECH_IDX], y[self.BG_IDX]
 
+    @torch.no_grad()
+    def separate_batch(self, xs):
+        """xs: numpy [B, C, T] at 16 kHz -> (speech [B, T], background [B, T]) float32 numpy.
+        Same chunking as separate(), but all B inputs run through the network together."""
+        if xs.ndim != 3 or xs.shape[1] != self.N_CHN:
+            raise ValueError(f"expects [B, {self.N_CHN}, T], got {tuple(xs.shape)}")
+        x = torch.from_numpy(np.ascontiguousarray(xs)).float().to(self.device)
+        T = x.shape[-1]
+        if self.seg is None or T <= int(self.seg * self.sr):
+            y = self._forward(x)
+        else:
+            L, c = int(self.seg * self.sr), int(self.ctx * self.sr)
+            outs = []
+            for s in range(0, T, L):
+                a, e = max(0, s - c), min(T, s + L)
+                outs.append(self._forward(x[:, :, a:e])[:, :, s - a:])
+            y = torch.cat(outs, dim=-1)
+        y = y.cpu().numpy()
+        return y[:, self.SPEECH_IDX], y[:, self.BG_IDX]
+
 
 if __name__ == "__main__":
     # Self-test: python nbss_separator.py CKPT 4ch_16k.wav OUT_DIR
@@ -118,5 +145,10 @@ if __name__ == "__main__":
         print(f"fp32 vs bf16 (speech): {rel_db(s_whole, s_bf16):.1f} dB")
     print(f"rms in(ref)={np.sqrt((x[0]**2).mean()):.4f} speech={np.sqrt((s_whole**2).mean()):.4f} "
           f"bg={np.sqrt((b_whole**2).mean()):.4f}")
+    # batch vs. sequential over the 4 rolled channels (checks that Norm treats batch items independently)
+    rolls = np.stack([np.roll(x, -c, axis=0) for c in range(4)])
+    sb, _ = sep.separate_batch(rolls)
+    seq = np.stack([sep.separate(r)[0] for r in rolls])
+    print("batch vs sequential (rolled, speech), dB per roll:", [round(rel_db(seq[i], sb[i]), 1) for i in range(4)])
     sf.write(os.path.join(out_dir, "speech.wav"), s_whole, sep.sr)
     sf.write(os.path.join(out_dir, "background.wav"), b_whole, sep.sr)

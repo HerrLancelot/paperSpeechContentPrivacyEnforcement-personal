@@ -37,7 +37,7 @@ from utils.random_splicing import split_wav_naive, apply_crossfade
 # ----------------------------------------------------------------------------
 # 1. Sprachschaetzung je Kanal (gerollte Referenz)
 # ----------------------------------------------------------------------------
-def separate_mc_rolled(sep_ref0, mix):
+def separate_mc_rolled(sep_ref0, mix, sep_batch=None):
     """
     mix: [C, T]. sep_ref0(x[C, T]) -> (voice[T], other[T]), geschaetzt am
     Referenzkanal 0 von x (so arbeitet der NBSS-Separator intern).
@@ -45,8 +45,18 @@ def separate_mc_rolled(sep_ref0, mix):
     Originalkanal c ist.
     Annahme: Arraygeometrie ist ein symmetrischer Ring (z.B. Quadrat), sodass
     ein zyklisches Rollen einer Drehung des Arrays entspricht.
+    sep_batch (optional): f(xs[B, C, T]) -> (speech[B, T], background[B, T]). Wenn gesetzt,
+    laufen alle C Rollungen in einem Batch (mehr Speicher, bessere GPU-Auslastung);
+    sonst nacheinander ueber sep_ref0.
     """
     C, T = mix.shape
+    if sep_batch is not None:
+        v, o = sep_batch(np.stack([np.roll(mix, -c, axis=0) for c in range(C)]))
+        voice = np.zeros((C, T), dtype=np.float32)
+        other = np.zeros((C, T), dtype=np.float32)
+        n = min(T, v.shape[-1])
+        voice[:, :n], other[:, :n] = v[:, :n], o[:, :n]
+        return voice, other
     voice = np.zeros((C, T), dtype=np.float32)
     other = np.zeros((C, T), dtype=np.float32)
     for c in range(C):
@@ -159,16 +169,18 @@ def vad_speech_flags(y_ref, sr, vad_model, vad_sr, speech_index, ths, device):
 # 4. Gesamtpipeline
 # ----------------------------------------------------------------------------
 def blur_audio_mc(
-    y, sr, segmin, segmax, framemin, sep_ref0,
+    y, sr, segmin, segmax, framemin, sep_ref0=None,
     seghopmin_perc=0.95, seghopmax_perc=0.95, framehopmin_perc=0.80,
     mixframe=True, reverse="backward", ref=0,
     vad_model=None, vad_sr=16000, vad_speech_index=None, vad_speech_ths=0.3,
     vad_mode="ref", device="cpu", seed=None, method="random_splicing_reverse",
-    tail_mode="last_window",
+    tail_mode="last_window", sep_batch=None, voice=None, other=None,
 ):
     """
     y: [C, T] Mehrkanal-Mischung. Rueckgabe: (y_out[C, T], info).
     vad_mode: 'ref' (nur Kanal ref, vergleichbar mit Mono) oder 'any' (ODER ueber Kanaele).
+    voice, other: optional bereits geschaetzte Sprache/Hintergrund [C, T] (z. B. aus dem Streaming mit
+      Links-Kontext); dann wird nicht getrennt und sep_ref0 darf None sein.
     tail_mode: Rest hinter dem letzten vollstaendigen 0,5-s-Fenster (bei 10 s: ca. 0,26 s).
       'raw'         = wie blur_audio im Original: Rest unveraendert aus y (Sprache bleibt dort hoerbar!)
       'last_window' = Rest bekommt eine eigene VAD-Entscheidung (letztes, am Ende ausgerichtetes
@@ -179,7 +191,12 @@ def blur_audio_mc(
     y = np.asarray(y, dtype=np.float32)
     C, T = y.shape
 
-    voice, other = separate_mc_rolled(sep_ref0, y)
+    if voice is None:
+        voice, other = separate_mc_rolled(sep_ref0, y, sep_batch=sep_batch)
+    else:
+        voice = np.asarray(voice, dtype=np.float32)
+        other = np.asarray(other, dtype=np.float32)
+        assert voice.shape == y.shape and other.shape == y.shape, (voice.shape, other.shape, y.shape)
 
     if seed is not None:
         random.seed(seed)

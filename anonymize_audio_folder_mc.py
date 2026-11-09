@@ -47,6 +47,7 @@ def main(a):
     speech_idx = next(k for k, v in ckpt["label_dict"].items() if v == name_to_id["Speech"])
 
     sep_ref0 = source_sep.separate
+    sep_batch = source_sep.separate_batch if a.batch_roll else None
 
     os.makedirs(a.output_dir, exist_ok=True)
     wavs = [f for f in sorted(os.listdir(a.input_dir)) if f.lower().endswith(".wav")]
@@ -60,7 +61,7 @@ def main(a):
             seghopmin_perc=a.seghopmin, seghopmax_perc=a.seghopmax, framehopmin_perc=a.framehopmin,
             mixframe=a.mixframe, reverse=a.reverse, vad_model=vad, vad_sr=SR,
             vad_speech_index=speech_idx, vad_speech_ths=0.3, vad_mode=a.vad_mode,
-            device=device, seed=a.seed + i, tail_mode=a.tail_mode,
+            device=device, seed=a.seed + i, tail_mode=a.tail_mode, sep_batch=sep_batch,
         )
         sf.write(os.path.join(a.output_dir, f), out.T, SR)
         print("done", f)
@@ -72,6 +73,7 @@ if __name__ == "__main__":
     p.add_argument("-o", "--output_dir", required=True)
     p.add_argument("-ckpt", "--ckpt", required=True)
     p.add_argument("--gpu-frac", type=float, default=0.25, help="Anteil GPU-Speicher (0 = kein Deckel)")
+    p.add_argument("--batch-roll", action="store_true", help="4 Rollungen in einem Batch (braucht ca. 4x Speicher)")
     p.add_argument("--seed", type=int, default=0, help="Basisseed; Datei i bekommt seed+i (reproduzierbar)")
     p.add_argument("--vad-mode", choices=["ref", "any"], default="ref")
     p.add_argument("--tail-mode", choices=["last_window", "raw"], default="last_window")
