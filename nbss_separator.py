@@ -29,19 +29,30 @@ class NBSSSeparator:
 
     # attention settings of the two trained variants (everything else in the config is identical)
     ATTENTION = {"retention": "ret(2)", "mamba": "mamba(16,4)"}
+    # Rechengenauigkeit des Netzes (Autocast); STFT/Norm/iSTFT laufen immer in fp32
+    AMP_DTYPE = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}
 
-    def __init__(self, ckpt_path, device="cpu", use_bf16=True, seg=20.0, ctx=2.0, arch="retention"):
+    def __init__(self, ckpt_path, device="cpu", use_bf16=True, seg=20.0, ctx=2.0, arch="retention",
+                 precision=None):
         """
         Args:
             ckpt_path: Lightning checkpoint (.ckpt) of the training run
             arch:      "retention" (attention ret(2)) or "mamba" (attention mamba(16,4), needs mamba_ssm, Linux)
             use_bf16:  run the network under bf16 autocast like the training (precision: bf16-mixed)
+            precision: "fp32" | "bf16" | "fp16" (Autocast, nur auf CUDA); None = aus use_bf16 abgeleitet.
+                       fp16: kleinerer Wertebereich als bf16; bei nicht-endlichen Werten wird der Aufruf
+                       in fp32 wiederholt und in self.n_fp16_fallback gezaehlt.
             seg:       chunk length in s for long files (None = whole file at once)
             ctx:       left context in s that is processed but discarded (model is causal)
         """
         self.device = torch.device(device)
         self.sr = self.SR
-        self.use_bf16 = use_bf16 and self.device.type == "cuda"
+        if precision is None:
+            precision = "bf16" if use_bf16 else "fp32"
+        if precision not in self.AMP_DTYPE:
+            raise ValueError(f"precision muss fp32, bf16 oder fp16 sein, nicht '{precision}'")
+        self.precision = precision if self.device.type == "cuda" else "fp32"   # CPU: nur fp32
+        self.n_fp16_fallback = 0
         self.seg, self.ctx = seg, ctx
 
         self.arch = OnlineSpatialNet(
@@ -68,6 +79,14 @@ class NBSSSeparator:
         for m in (self.arch, self.stft, self.norm):
             m.eval().to(self.device)
 
+    @property
+    def use_bf16(self):                      # Kompatibilitaet zu aelteren Skripten
+        return self.precision == "bf16"
+
+    @use_bf16.setter
+    def use_bf16(self, v):
+        self.precision = "bf16" if v else "fp32"
+
     @torch.no_grad()
     def _forward(self, x):
         """x: [B, C, T] -> [B, Spk, T]; same steps as TrainModule.forward (loss neg_snr, no mask)."""
@@ -75,9 +94,14 @@ class NBSSSeparator:
         B, C, F, T = X.shape
         X, (Xr, XrMM) = self.norm.norm(X, ref_channel=self.REF_CHANNEL)
         X = torch.view_as_real(X.permute(0, 2, 3, 1)).reshape(B, F, T, -1)  # [B,F,T,2C]
-        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=self.use_bf16):
+        amp = self.AMP_DTYPE[self.precision] if self.device.type == "cuda" else None
+        with torch.autocast(device_type=self.device.type, dtype=amp or torch.bfloat16, enabled=amp is not None):
             out = self.arch(X)
-        out = torch.view_as_complex(out.float().reshape(B, F, T, -1, 2)).permute(0, 3, 1, 2)  # [B,Spk,F,T]
+        out = out.float()
+        if self.precision == "fp16" and amp is not None and not torch.isfinite(out).all():
+            self.n_fp16_fallback += 1               # Ueberlauf in fp16 -> dieser Aufruf in fp32
+            out = self.arch(X).float()
+        out = torch.view_as_complex(out.reshape(B, F, T, -1, 2)).permute(0, 3, 1, 2)  # [B,Spk,F,T]
         out = self.norm.inorm(out, (Xr, XrMM))
         return self.stft.istft(out, stft_paras)                             # [B,Spk,T]
 
@@ -140,9 +164,12 @@ if __name__ == "__main__":
     s_chunk, _ = sep.separate(x)
     print(f"whole vs chunked (speech): {rel_db(s_whole, s_chunk):.1f} dB")
     if dev == "cuda":
-        sep.use_bf16, sep.seg = True, None
-        s_bf16, _ = sep.separate(x)
-        print(f"fp32 vs bf16 (speech): {rel_db(s_whole, s_bf16):.1f} dB")
+        for prec in ("bf16", "fp16"):
+            sep.precision, sep.seg = prec, None
+            s_p, _ = sep.separate(x)
+            print(f"fp32 vs {prec} (speech): {rel_db(s_whole, s_p):.1f} dB"
+                  f"{'  (fp16-Fallbacks: %d)' % sep.n_fp16_fallback if prec == 'fp16' else ''}")
+        sep.precision = "fp32"                  # Rest des Selbsttests wieder in fp32
     print(f"rms in(ref)={np.sqrt((x[0]**2).mean()):.4f} speech={np.sqrt((s_whole**2).mean()):.4f} "
           f"bg={np.sqrt((b_whole**2).mean()):.4f}")
     # batch vs. sequential over the 4 rolled channels (checks that Norm treats batch items independently)

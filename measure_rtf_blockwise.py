@@ -70,7 +70,11 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--wav", required=True)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--fp32", action="store_true", help="NBSS in fp32 statt bf16-Autocast")
+    ap.add_argument("--fp32", action="store_true", help="NBSS in fp32 statt bf16-Autocast (= --dtype fp32)")
+    ap.add_argument("--dtype", choices=["fp32", "bf16", "fp16"], default=None,
+                    help="NBSS-Genauigkeit (Standard bf16, mit --fp32 fp32). fp16 erst gegen fp32 pruefen (eval_context_dtype.py)")
+    ap.add_argument("--skip-nonspeech", action="store_true",
+                    help="NBSS nur in Bloecken mit Sprache laut VAD (senkt den Mittelwert, nicht das Maximum)")
     ap.add_argument("--arch", choices=["retention", "mamba"], default="retention", help="Modellvariante des Checkpoints")
     ap.add_argument("--mc-out", action="store_true", help="Mehrkanal-Ausgabe (4 Kanaele, 4 gerollte NBSS-Laeufe je Block)")
     ap.add_argument("--batch-roll", action="store_true", help="mit --mc-out: die 4 Rollungen als ein Batch")
@@ -99,7 +103,8 @@ def main():
     args = ap.parse_args()
 
     dev = torch.device(args.device)
-    sep = NBSSSeparator(args.ckpt, device=args.device, use_bf16=not args.fp32, seg=None, arch=args.arch)
+    precision = args.dtype or ("fp32" if args.fp32 else "bf16")
+    sep = NBSSSeparator(args.ckpt, device=args.device, precision=precision, seg=None, arch=args.arch)
     sr = sep.sr
     beats, speech_idx = load_beats(args.beats_ckpt, args.ontology, dev)
     vad = TimedVAD(beats, dev)
@@ -120,12 +125,22 @@ def main():
               framehopmin_perc=args.framehopmin, mixframe=bool(args.mixframe), reverse=args.reverse,
               device=dev, vad_model=vad, vad_sr=16000, vad_speech_index=speech_idx,
               vad_speech_ths=args.speech_ths, method=args.method)
-    if args.mc_out:
-        anon = StreamAnonymizerMC(sep, kw, block_s=args.block, ctx_s=args.ctx, batch_roll=args.batch_roll,
-                                  vad_mode=args.vad_mode)
-    else:
-        anon = StreamAnonymizer(sep, kw, blur_fn=anonymizer.blur_audio, block_s=args.block, ctx_s=args.ctx)
+    def make_anon(skip):
+        if args.mc_out:
+            return StreamAnonymizerMC(sep, kw, block_s=args.block, ctx_s=args.ctx, batch_roll=args.batch_roll,
+                                      vad_mode=args.vad_mode, skip_nonspeech=skip)
+        return StreamAnonymizer(sep, kw, blur_fn=anonymizer.blur_audio, block_s=args.block, ctx_s=args.ctx,
+                                skip_nonspeech=skip)
+
+    anon = make_anon(args.skip_nonspeech)
     assert args.input_chunk <= anon.block
+    if args.skip_nonspeech:          # NBSS vorwaermen, falls die ersten echten Bloecke uebersprungen werden
+        warm, rng = make_anon(False), np.random.default_rng(0)
+        for _ in range(3):
+            warm.push(0.01 * rng.standard_normal((sep.N_CHN, warm.block)).astype(np.float32))
+        del warm
+        vad.t.clear()
+        t_splice.clear()
 
     x, fs = sf.read(args.wav, dtype="float32", always_2d=True)
     assert fs == sr and x.shape[1] >= sep.N_CHN, (fs, x.shape)
@@ -134,8 +149,8 @@ def main():
         x = np.tile(x, (1, int(np.ceil(args.seconds * sr / x.shape[1]))))
     x = x[:, :int(args.seconds * sr)]
     print(f"Geraet={dev}, Eingang {x.shape[1] / sr:.1f} s, Block={anon.block} Samples = {anon.block_seconds:.3f} s "
-          f"(Raster), Kontext={args.ctx} s, NBSS-Praezision={'bf16' if sep.use_bf16 else 'fp32'}, arch={args.arch}, "
-          f"Ausgabe={'4 Kanaele' if args.mc_out else 'mono'}")
+          f"(Raster), Kontext={args.ctx} s, NBSS-Praezision={sep.precision}, arch={args.arch}, "
+          f"Ausgabe={'4 Kanaele' if args.mc_out else 'mono'}, skip-nonspeech={args.skip_nonspeech}")
 
     rows, outs = [], []
     if dev.type == "cuda":
@@ -166,6 +181,10 @@ def main():
     if dev.type == "cuda":
         print(f"  GPU-Spitzenspeicher: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
     print(f"  im Puffer verbleibend (nie ausgegeben): {anon.pending_seconds:.2f} s")
+    if args.skip_nonspeech:
+        print(f"  Bloecke ohne NBSS (keine Sprache laut VAD): {anon.n_skipped} von {len(rows)}")
+    if sep.n_fp16_fallback:
+        print(f"  [!] fp16-Ueberlaeufe, in fp32 wiederholt: {sep.n_fp16_fallback}")
 
     if args.out:
         y_out = np.concatenate(outs, axis=-1)
@@ -173,7 +192,9 @@ def main():
         print(f"Ausgabe: {args.out}")
     if args.json:
         with open(args.json, "w") as f:
-            json.dump(dict(block_s=dur, rows=rows, warmup=args.warmup), f)
+            json.dump(dict(block_s=dur, rows=rows, warmup=args.warmup, precision=sep.precision, ctx_s=args.ctx,
+                           arch=args.arch, mc_out=args.mc_out, skip_nonspeech=args.skip_nonspeech,
+                           n_skipped=anon.n_skipped, fp16_fallbacks=sep.n_fp16_fallback), f)
 
 
 if __name__ == "__main__":

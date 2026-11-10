@@ -3,6 +3,8 @@
 Das Mikrofon-Callback legt nur Chunks in eine Queue. Der Hauptthread schiebt sie in den StreamAnonymizer
 (Ringpuffer, Block + Kontext). Geschrieben wird ausschliesslich das anonymisierte Ergebnis; Rohaudio bleibt im
 Speicher des Puffers und wird nie auf die Platte geschrieben. Reste kleiner als ein Block werden verworfen.
+AUSNAHME nur auf ausdruecklichen Wunsch: --raw-out schreibt die 4 Modellkanaele roh in eine wav (Referenz fuer
+Testaudio ohne Personen im Raum; wird vorher abgefragt, --yes ueberspringt die Abfrage).
 
 Gemessen wird (Kriterium: Verarbeitung pro Block < Blockdauer, Puffer laeuft nicht ueber):
   RTF je Block, Backlog (Sekunden Audio, die in der Queue auf Verarbeitung warten), Latenz ab letztem
@@ -34,7 +36,7 @@ from stream_anonymizer_mc import StreamAnonymizerMC
 
 class DummySep:
     """Platzhalter ohne Modell (nur Funktionstest der Live-Kette): Sprache = Kanal 0, Hintergrund = 0."""
-    sr, N_CHN, use_bf16 = 16000, 4, False
+    sr, N_CHN, use_bf16, precision = 16000, 4, False, "fp32"
 
     def separate(self, x):
         return x[0].copy(), np.zeros_like(x[0])
@@ -47,12 +49,17 @@ def list_inputs(sd):
 
 
 def pick_device(sd, name, hostapi, min_channels):
-    """Erstes Eingabegeraet mit Namensteil, passender Host-API und genug Kanaelen (wie im Mikrotest)."""
-    for i, n, h, c in list_inputs(sd):
-        if name.lower() in n.lower() and (not hostapi or hostapi.lower() in h.lower()) and c >= min_channels:
-            return i
-    raise SystemExit(f"Kein Eingabegeraet mit '{name}' / Host-API '{hostapi}' / >= {min_channels} Kanaelen "
-                     f"gefunden. Siehe --list-devices.")
+    """Erstes Eingabegeraet mit Namensteil, passender Host-API und genug Kanaelen (wie im Mikrotest).
+    Bei mehreren Treffern (z. B. Linux: mehrere ALSA-Eintraege) wird der erste genommen und die Auswahl gemeldet."""
+    hits = [(i, n, h) for i, n, h, c in list_inputs(sd)
+            if name.lower() in n.lower() and (not hostapi or hostapi.lower() in h.lower()) and c >= min_channels]
+    if not hits:
+        raise SystemExit(f"Kein Eingabegeraet mit '{name}' / Host-API '{hostapi}' / >= {min_channels} Kanaelen "
+                         f"gefunden. Siehe --list-devices.")
+    if len(hits) > 1:
+        print(f"[i] {len(hits)} passende Eingabegeraete, nehme Index {hits[0][0]}; Alternativen: "
+              + ", ".join(f"{i} ({h}: {n})" for i, n, h in hits[1:]) + "  (--input-device <Index> erzwingt eines)")
+    return hits[0][0]
 
 
 def main():
@@ -67,7 +74,14 @@ def main():
     ap.add_argument("--use-channels", default=None, help="Kommagetrennte Geraetekanaele fuer das Modell (4 Stueck, "
                     "Reihenfolge wie im Training, Referenz = erster), Standard 0,1,2,3")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--fp32", action="store_true")
+    ap.add_argument("--fp32", action="store_true", help="NBSS in fp32 (gleichbedeutend mit --dtype fp32)")
+    ap.add_argument("--dtype", choices=["fp32", "bf16", "fp16"], default=None,
+                    help="NBSS-Genauigkeit (Standard: bf16, mit --fp32: fp32). fp16 erst gegen fp32 pruefen (eval_context_dtype.py)")
+    ap.add_argument("--skip-nonspeech", action="store_true",
+                    help="NBSS (und Splicing) nur in Bloecken, in denen die VAD Sprache findet; sonst Block unveraendert")
+    ap.add_argument("--raw-out", default=None,
+                    help="ACHTUNG: schreibt die 4 Modellkanaele ROH in diese wav (nur Testaudio ohne Personen im Raum)")
+    ap.add_argument("--yes", action="store_true", help="Rueckfrage bei --raw-out ueberspringen")
     ap.add_argument("--arch", choices=["retention", "mamba"], default="retention", help="Modellvariante des Checkpoints (mamba nur Linux)")
     ap.add_argument("--mc-out", action="store_true", help="Mehrkanal-Ausgabe (4-Kanal-wav, 4 gerollte NBSS-Laeufe je Block)")
     ap.add_argument("--batch-roll", action="store_true", help="mit --mc-out: die 4 Rollungen als ein Batch")
@@ -105,7 +119,8 @@ def main():
 
     dev = torch.device(args.device)
     print("Lade Modell ..." if not args.dummy_sep else "Dummy-Separator (kein Modell)", flush=True)
-    sep = DummySep() if args.dummy_sep else NBSSSeparator(args.ckpt, device=args.device, use_bf16=not args.fp32, seg=None, arch=args.arch)
+    precision = args.dtype or ("fp32" if args.fp32 else "bf16")
+    sep = DummySep() if args.dummy_sep else NBSSSeparator(args.ckpt, device=args.device, precision=precision, seg=None, arch=args.arch)
     sr = sep.sr
     print("Lade BEATs ...", flush=True)
     beats, speech_idx = load_beats(args.beats_ckpt, args.ontology, dev)
@@ -129,13 +144,14 @@ def main():
     # Warm-up (CUDA-Init, Kernel-Auswahl) mit Rauschen, getrennte Instanz, damit der Live-Strom unberuehrt bleibt
     print("Warm-up (3 Bloecke mit Rauschen) ...", flush=True)
     t_w = time.perf_counter()
-    def make_anon():
+    def make_anon(skip=False):
         if args.mc_out:
             return StreamAnonymizerMC(sep, kw, block_s=args.block, ctx_s=args.ctx, batch_roll=args.batch_roll,
-                                      vad_mode=args.vad_mode)
-        return StreamAnonymizer(sep, kw, blur_fn=anonymizer.blur_audio, block_s=args.block, ctx_s=args.ctx)
+                                      vad_mode=args.vad_mode, skip_nonspeech=skip)
+        return StreamAnonymizer(sep, kw, blur_fn=anonymizer.blur_audio, block_s=args.block, ctx_s=args.ctx,
+                                skip_nonspeech=skip)
 
-    warm = make_anon()
+    warm = make_anon(False)            # Warm-up immer mit NBSS, auch wenn --skip-nonspeech gesetzt ist
     rng = np.random.default_rng(0)
     for i in range(3):
         warm.push(0.01 * rng.standard_normal((sep.N_CHN, warm.block)).astype(np.float32))
@@ -144,7 +160,7 @@ def main():
     t_splice.clear()
     del warm
 
-    anon = make_anon()
+    anon = make_anon(args.skip_nonspeech)
     use = [int(c) for c in args.use_channels.split(",")] if args.use_channels else list(range(sep.N_CHN))
     assert len(use) == sep.N_CHN and max(use) < args.channels, (use, args.channels)
     if args.input_device is None:
@@ -169,10 +185,17 @@ def main():
     rows, backlog_max = [], 0.0
     dur = anon.block_seconds
     print(f"Block={anon.block} Samples = {dur:.3f} s, Kontext={args.ctx} s, Chunk={args.chunk} Samples "
-          f"({1000 * args.chunk / sr:.0f} ms), NBSS={'DUMMY (kein Modell)' if args.dummy_sep else 'bf16' if sep.use_bf16 else 'fp32'}, arch={args.arch}, "
-          f"Ausgabe={'4 Kanaele' if args.mc_out else 'mono'}, Kanaele {use}")
+          f"({1000 * args.chunk / sr:.0f} ms), NBSS={'DUMMY (kein Modell)' if args.dummy_sep else sep.precision}, arch={args.arch}, "
+          f"Ausgabe={'4 Kanaele' if args.mc_out else 'mono'}, Kanaele {use}, skip-nonspeech={args.skip_nonspeech}")
     print(f"Aufnahme {args.seconds:.0f} s ... (Strg+C beendet frueher)", flush=True)
     out = sf.SoundFile(args.out, "w", samplerate=sr, channels=sep.N_CHN if args.mc_out else 1)
+    raw = None
+    if args.raw_out:
+        print(f"\n*** ACHTUNG: --raw-out speichert den ROHTON ({sep.N_CHN} Kanaele) in '{args.raw_out}'. ***\n"
+              f"*** Nur Testaudio ohne Personen im Raum! Datei danach getrennt ablegen und beschriften. ***")
+        if not args.yes and input("Wirklich roh aufnehmen? [j/N] ").strip().lower() not in ("j", "ja", "y", "yes"):
+            raise SystemExit("abgebrochen (kein Rohton gespeichert)")
+        raw = sf.SoundFile(args.raw_out, "w", samplerate=sr, channels=sep.N_CHN, subtype="FLOAT")
     stream = sd.InputStream(device=dev_in, channels=args.channels, samplerate=sr, dtype="float32",
                             blocksize=args.chunk, callback=callback)
     t_stop = None
@@ -189,6 +212,8 @@ def main():
                         t_print = time.monotonic()
                     continue
                 n_chunks += 1
+                if raw is not None:
+                    raw.write(chunk.T)
                 backlog = q.qsize() * args.chunk / sr
                 backlog_max = max(backlog_max, backlog)
                 i_vad, i_spl = len(vad.t), len(t_splice)
@@ -212,6 +237,8 @@ def main():
         print("abgebrochen")
     finally:
         out.close()
+        if raw is not None:
+            raw.close()
 
     keep = rows[args.warmup:]
     print(f"\n{len(rows)} Bloecke ausgegeben ({len(keep)} in der Statistik), {anon.pending_seconds:.2f} s Rest im Puffer verworfen")
@@ -222,15 +249,22 @@ def main():
             print(f"  {name:<20s} {stats([r[k] for r in keep])}")
         print(f"\n  RTF  Mittel {rtf.mean():.3f}  p95 {np.percentile(rtf, 95):.3f}  MAX {rtf.max():.3f}   "
               f"(Bloecke mit RTF >= 1: {(rtf >= 1).sum()})")
+    if args.skip_nonspeech:
+        print(f"  Bloecke ohne NBSS (keine Sprache laut VAD): {anon.n_skipped} von {len(rows)}")
+    if getattr(sep, "n_fp16_fallback", 0):
+        print(f"  [!] fp16-Ueberlaeufe, in fp32 wiederholt: {sep.n_fp16_fallback}")
     print(f"  Backlog max: {backlog_max:.2f} s   Eingabe-Meldungen von PortAudio: {len(events)}")
     for t, s in events[:5]:
         print(f"    {s}")
     ok = bool(keep) and rtf.max() < 1 and not events
     print("  -> " + ("Kriterium erfuellt (RTF < 1, keine Ueberlaeufe)" if ok else "Kriterium NICHT erfuellt, Details oben"))
-    print(f"Ausgabe (nur anonymisiert): {args.out}")
+    print(f"Ausgabe (anonymisiert): {args.out}" + (f"   ROH-Aufnahme: {args.raw_out}" if raw is not None else ""))
     if args.json:
         with open(args.json, "w") as f:
-            json.dump(dict(block_s=dur, rows=rows, backlog_max=backlog_max, events=[s for _, s in events]), f)
+            json.dump(dict(block_s=dur, rows=rows, backlog_max=backlog_max, events=[s for _, s in events],
+                           precision=sep.precision, ctx_s=args.ctx, arch=args.arch, mc_out=args.mc_out,
+                           skip_nonspeech=args.skip_nonspeech, n_skipped=anon.n_skipped,
+                           fp16_fallbacks=getattr(sep, "n_fp16_fallback", 0)), f)
 
 
 if __name__ == "__main__":

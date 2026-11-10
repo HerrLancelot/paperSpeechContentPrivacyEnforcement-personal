@@ -11,6 +11,11 @@ ausschliesslich der Rueckgabewert von blur_audio. Die Blocklaenge liegt auf dem 
 (n + k*hop), damit blur_audio keinen unbedeckten Rest am Blockende mit Rohsignal auffuellt
 (sonst wuerden pro Block ~0,18 s Original ausgegeben). Das wird pro Block geprueft.
 
+Optional (skip_nonspeech=True): Vor dem Block laeuft die BEATs-VAD (identische Entscheidung wie in blur_audio).
+Ist in keinem 0,5-s-Fenster Sprache, wird NBSS uebersprungen und der Block unveraendert ausgegeben (das tut
+blur_audio fuer Nicht-Sprach-Fenster ohnehin); der Links-Kontext wird trotzdem fortgeschrieben.
+Das senkt den mittleren Rechenaufwand, nicht den schlechtesten Block (Dauergespraech).
+
 Nur numpy; blur_audio wird uebergeben oder lazy aus anonymizer.py importiert.
 """
 import time
@@ -46,9 +51,16 @@ class ContextSeparator:
         self.prev = x[:, -self.ctx:].copy() if self.ctx > 0 else None
         return voice[-L:], other[-L:]
 
+    def advance(self, y_mc):
+        """Block ohne NBSS-Lauf: nur den rohen Links-Kontext fortschreiben (bleibt im RAM)."""
+        if self.ctx > 0:
+            x = y_mc if self.prev is None else np.concatenate([self.prev, y_mc], axis=-1)
+            self.prev = x[:, -self.ctx:].copy()
+
 
 class StreamAnonymizer:
-    def __init__(self, separator, blur_kwargs, blur_fn=None, block_s=2.0, ctx_s=2.0, n_chan=4):
+    def __init__(self, separator, blur_kwargs, blur_fn=None, block_s=2.0, ctx_s=2.0, n_chan=4,
+                 skip_nonspeech=False):
         """
         separator:   NBSSSeparator (am besten seg=None)
         blur_kwargs: Argumente fuer blur_audio ohne y, sr, source_sep (segmin, segmax, framemin, ...,
@@ -62,6 +74,7 @@ class StreamAnonymizer:
         self.blur_fn, self.blur_kwargs = blur_fn, dict(blur_kwargs)
         self.buf = np.zeros((n_chan, 0), dtype=np.float32)
         self.t_block = []        # Sekunden je Block (gesamt, ohne Warten auf Eingang)
+        self.skip_nonspeech, self.n_skipped = skip_nonspeech, 0
 
     @property
     def block_seconds(self):
@@ -70,6 +83,16 @@ class StreamAnonymizer:
     @property
     def pending_seconds(self):
         return self.buf.shape[1] / self.sr
+
+    def _has_speech(self, blk):
+        """Gleiche VAD-Entscheidung wie blur_audio (Referenzkanal 0, 0,5-s-Fenster); True, wenn irgendein Fenster Sprache hat."""
+        kw = self.blur_kwargs
+        if kw.get("vad_model") is None:
+            return True
+        from mc_anonymizer import vad_speech_flags
+        flags = vad_speech_flags(blk[0], self.sr, kw["vad_model"], kw["vad_sr"], kw["vad_speech_index"],
+                                 kw["vad_speech_ths"], kw["device"])
+        return bool(np.any(flags))
 
     def push(self, x):
         """x: [C, n] float (beliebige n, z. B. Callback-Chunks) -> Liste anonymisierter Bloecke [block]."""
@@ -82,7 +105,13 @@ class StreamAnonymizer:
             blk = np.ascontiguousarray(self.buf[:, :self.block])
             self.buf = self.buf[:, self.block:].copy()
             t0 = time.perf_counter()
-            y = self.blur_fn(blk, self.sr, source_sep=self.ctxsep, **self.blur_kwargs)
+            if self.skip_nonspeech and not self._has_speech(blk):
+                self.ctxsep.advance(blk)
+                self.ctxsep.t_sep.append(0.0)
+                self.n_skipped += 1
+                y = blk[0].copy()
+            else:
+                y = self.blur_fn(blk, self.sr, source_sep=self.ctxsep, **self.blur_kwargs)
             self.t_block.append(time.perf_counter() - t0)
             y = np.asarray(y, dtype=np.float32)
             if y.shape[-1] != self.block:

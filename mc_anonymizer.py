@@ -141,7 +141,7 @@ def apply_plan(y, chunker, plan):
 # ----------------------------------------------------------------------------
 # 3. VAD (BEATs), einmal fuer alle Kanaele
 # ----------------------------------------------------------------------------
-def vad_speech_flags(y_ref, sr, vad_model, vad_sr, speech_index, ths, device):
+def vad_speech_flags(y_ref, sr, vad_model, vad_sr, speech_index, ths, device, pad_quirk=True):
     """Fensterweise Sprachentscheidung wie in blur_audio; Rueckgabe bool[n_windows]."""
     chunker = AudioChunks(n=round(0.5 * sr), hop=round(0.440 * sr))
     y_n = chunker.chunks_with_hop(y_ref)
@@ -155,8 +155,15 @@ def vad_speech_flags(y_ref, sr, vad_model, vad_sr, speech_index, ths, device):
     if sr != vad_sr:
         x = torchaudio.transforms.Resample(orig_freq=sr, new_freq=vad_sr)(x)
     x = x / torch.max(torch.abs(x))
-    target = int(0.5 * vad_sr)
-    if x.shape[-1] < target:
+    # Wie in blur_audio (Upstream): Die Bedingung vergleicht die ANZAHL der Fenster (shape[0]) mit 8000 und
+    # haengt deshalb an jedes 0,5-s-Fenster Nullen an (bei 5 Fenstern 7995 Stueck, BEATs sieht ca. 1 s Eingang
+    # mit ~50 % Nullen). Fuer Vergleichbarkeit mit der Mono-Pipeline und allen bisherigen Ergebnissen
+    # wird das nachgebildet (pad_quirk=True). pad_quirk=False: Fenster bleiben 0,5 s lang.
+    target = int(0.5 * 16000)
+    if pad_quirk:
+        if x.shape[0] < target:
+            x = torch.nn.functional.pad(x, (0, target - x.shape[0]))
+    elif x.shape[-1] < target:
         x = torch.nn.functional.pad(x, (0, target - x.shape[-1]))
     with torch.no_grad():
         x = x.to(device)
@@ -173,7 +180,7 @@ def blur_audio_mc(
     seghopmin_perc=0.95, seghopmax_perc=0.95, framehopmin_perc=0.80,
     mixframe=True, reverse="backward", ref=0,
     vad_model=None, vad_sr=16000, vad_speech_index=None, vad_speech_ths=0.3,
-    vad_mode="ref", device="cpu", seed=None, method="random_splicing_reverse",
+    vad_mode="ref", vad_pad_quirk=True, device="cpu", seed=None, method="random_splicing_reverse",
     tail_mode="last_window", sep_batch=None, voice=None, other=None,
 ):
     """
@@ -216,9 +223,9 @@ def blur_audio_mc(
     if vad_mode == "any":
         flags = np.zeros(len(AudioChunks(round(0.5 * sr), round(0.44 * sr)).chunks_with_hop(y[0])), bool)
         for c in range(C):
-            flags |= vad_speech_flags(y[c], sr, vad_model, vad_sr, vad_speech_index, vad_speech_ths, device)
+            flags |= vad_speech_flags(y[c], sr, vad_model, vad_sr, vad_speech_index, vad_speech_ths, device, vad_pad_quirk)
     else:
-        flags = vad_speech_flags(y[ref], sr, vad_model, vad_sr, vad_speech_index, vad_speech_ths, device)
+        flags = vad_speech_flags(y[ref], sr, vad_model, vad_sr, vad_speech_index, vad_speech_ths, device, vad_pad_quirk)
 
     # VAD-Entscheidung fuer den Rest hinter dem letzten Fenster
     n_win = round(0.5 * sr)
@@ -227,7 +234,7 @@ def blur_audio_mc(
         chans = range(C) if vad_mode == "any" else [ref]
         tail_speech = any(
             bool(vad_speech_flags(y[c][T - n_win:], sr, vad_model, vad_sr, vad_speech_index,
-                                  vad_speech_ths, device)[0])
+                                  vad_speech_ths, device, vad_pad_quirk)[0])
             for c in chans
         )
     elif tail_mode == "last_window" and vad_model is None:
