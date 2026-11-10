@@ -22,6 +22,7 @@ import types
 import numpy as np
 
 import mc_anonymizer
+from stream_anonymizer import vad_flags_like_blur_audio
 from stream_anonymizer import snap_block   # gleiches Blockraster wie StreamAnonymizer
 
 class StreamAnonymizerMC:
@@ -71,8 +72,9 @@ class StreamAnonymizerMC:
         if kw.get("vad_model") is None:
             return True
         for c in (range(self.C) if self.vad_mode == "any" else [0]):
-            flags = mc_anonymizer.vad_speech_flags(blk[c], self.sr, kw["vad_model"], kw["vad_sr"],
-                                                   kw["vad_speech_index"], kw["vad_speech_ths"], kw["device"])
+            flags = vad_flags_like_blur_audio(blk[c], self.sr, kw["vad_model"], kw["vad_sr"], kw["vad_speech_index"],
+                                              kw["vad_speech_ths"], kw["device"],
+                                              pad_quirk=kw.get("vad_pad_quirk", True))
             if np.any(flags):
                 return True
         return False

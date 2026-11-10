@@ -32,6 +32,30 @@ def snap_block(block_s, sr):
     return n + k * hop
 
 
+def vad_flags_like_blur_audio(y_ref, sr, vad_model, vad_sr, speech_index, ths, device, pad_quirk=True):
+    """Fensterweise Sprachentscheidung EXAKT wie in anonymizer.blur_audio (Referenzkanal, 0,5-s-Fenster, Hop 0,44 s).
+
+    pad_quirk=True bildet den Original-Fehler nach: blur_audio vergleicht die ANZAHL der Fenster mit 8000 und haengt
+    deshalb jedem Fenster (8000 - Anzahl) Nullen an (BEATs sieht ~1 s, davon ~50 % Nullen). Muss mit blur_audio
+    uebereinstimmen, sonst wuerde --skip-nonspeech Sprache durchlassen; test_new_features.py prueft das.
+    """
+    import torch
+    import torchaudio
+    from anonymizer import AudioChunks
+    y_n = AudioChunks(n=round(0.5 * sr), hop=round(0.440 * sr)).chunks_with_hop(y_ref)
+    x = torchaudio.transforms.Resample(orig_freq=sr, new_freq=vad_sr)(torch.tensor(y_n, dtype=torch.float32))
+    x = x / torch.max(torch.abs(x))
+    target = int(0.5 * 16000)
+    n_cmp = x.shape[0] if pad_quirk else x.shape[-1]
+    if n_cmp < target:
+        x = torch.nn.functional.pad(x, (0, target - n_cmp))
+    with torch.no_grad():
+        inp = x.clone().detach().to(device)
+        mask = torch.zeros(inp.size(0), inp.size(1)).bool().to(device)
+        logit = vad_model.extract_features(inp, padding_mask=mask)[0][:, speech_index]
+    return (logit > ths).cpu().numpy()
+
+
 class ContextSeparator:
     """source_sep-Adapter fuer blur_audio: .separate([C,T], sr) -> (voice[T], other[T])."""
 
@@ -89,9 +113,8 @@ class StreamAnonymizer:
         kw = self.blur_kwargs
         if kw.get("vad_model") is None:
             return True
-        from mc_anonymizer import vad_speech_flags
-        flags = vad_speech_flags(blk[0], self.sr, kw["vad_model"], kw["vad_sr"], kw["vad_speech_index"],
-                                 kw["vad_speech_ths"], kw["device"])
+        flags = vad_flags_like_blur_audio(blk[0], self.sr, kw["vad_model"], kw["vad_sr"], kw["vad_speech_index"],
+                                          kw["vad_speech_ths"], kw["device"])
         return bool(np.any(flags))
 
     def push(self, x):
