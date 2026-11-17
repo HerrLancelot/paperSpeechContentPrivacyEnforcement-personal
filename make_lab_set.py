@@ -242,7 +242,7 @@ def cmd_select(a):
             name = f"{'foa' if kind == 'foa' else 'pts'}{k + 1:02d}"
             utts = pick_speech(speech, rng, a)
             scene = {"name": name, "kind": kind, "seed": a.seed * 1000 + idx, "duration": a.duration,
-                     "snr_db": a.snr_db, "speech_start": a.speech_start, "speech_gap": a.speech_gap,
+                     "snr_db": a.snr_db[k % len(a.snr_db)], "speech_start": a.speech_start, "speech_gap": a.speech_gap,
                      "speech_slot": a.speech_slot, "speech": []}
             for r in utts:
                 scene["speech"].append({"file": None if a.dry_run else copy_asset(r["file"], "speech", out),
@@ -343,7 +343,8 @@ def main():
     s.add_argument("--speech_gap", type=float, default=3.0)
     s.add_argument("--min_utt", type=float, default=3.0)
     s.add_argument("--max_utt", type=float, default=15.0)
-    s.add_argument("--snr_db", type=float, default=6.0)
+    s.add_argument("--snr_db", type=float, nargs="+", default=[6.0],
+                   help="ein oder mehrere SNR-Werte; mehrere werden reihum auf die Szenen eines Kinds verteilt")
     s.add_argument("--speech_slot", default="FC")
     s.add_argument("--n_points", type=int, nargs=2, default=[1, 3], metavar=("MIN", "MAX"))
     s.add_argument("--ambi_format", default="acn_sn3d", choices=["acn_sn3d", "acn_n3d", "fuma"])

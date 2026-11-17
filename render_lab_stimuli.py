@@ -129,7 +129,8 @@ def tile_clip(clip, n, sr, rng, gap):
         c[:fade] *= w[:fade]
         c[-fade:] *= w[fade:]
     out = np.zeros(n, np.float32)
-    pos = -int(rng.uniform(0, len(c)))
+    # Clip mindestens so lang wie die Szene (z. B. verkettete Hintergruende): Ausschnitt OHNE Wiederholungsnaht
+    pos = -int(rng.uniform(0, len(c) - n + 1)) if len(c) >= n else -int(rng.uniform(0, len(c)))
     while pos < n:
         a, b = max(pos, 0), min(pos + len(c), n)
         out[a:b] = c[a - pos:b - pos]

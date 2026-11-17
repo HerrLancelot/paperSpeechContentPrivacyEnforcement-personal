@@ -158,7 +158,7 @@ if __name__ == "__main__":
     def rel_db(a, b):  # how close b is to a (higher = closer)
         return 10 * np.log10((a ** 2).sum() / max(((a - b) ** 2).sum(), 1e-12))
 
-    sep = NBSSSeparator(ckpt, dev, use_bf16=False, seg=None, arch = "mamba")
+    sep = NBSSSeparator(ckpt, dev, use_bf16=False, seg=None)
     s_whole, b_whole = sep.separate(x)
     sep.seg = 10.0
     s_chunk, _ = sep.separate(x)
