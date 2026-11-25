@@ -35,7 +35,7 @@ def main(a):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda" and a.gpu_frac:  # GPU-Deckel (Training laeuft parallel); falls ihr einen eigenen Helfer habt, hier ersetzen
         torch.cuda.set_per_process_memory_fraction(a.gpu_frac)
-    source_sep = NBSSSeparator(a.ckpt, device=str(device))
+    source_sep = NBSSSeparator(a.ckpt, device=str(device), arch=a.arch)
 
     ckpt = torch.load(os.path.abspath("./beats/models/BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt"),
                       map_location=device)
@@ -72,6 +72,7 @@ if __name__ == "__main__":
     p.add_argument("-i", "--input_dir", required=True)
     p.add_argument("-o", "--output_dir", required=True)
     p.add_argument("-ckpt", "--ckpt", required=True)
+    p.add_argument("--arch", choices=["retention", "mamba"], default="retention", help="Architektur des Checkpoints")
     p.add_argument("--gpu-frac", type=float, default=0.25, help="Anteil GPU-Speicher (0 = kein Deckel)")
     p.add_argument("--batch-roll", action="store_true", help="4 Rollungen in einem Batch (braucht ca. 4x Speicher)")
     p.add_argument("--seed", type=int, default=0, help="Basisseed; Datei i bekommt seed+i (reproduzierbar)")

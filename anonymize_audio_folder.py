@@ -29,7 +29,7 @@ def anonymize_audio(args):
     force_cpu = False
     device = torch.device("cpu") if force_cpu else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    source_sep = SourceSeparation(args.sep_method, device=device, ckpt_path=args.ckpt) if do_sep else None
+    source_sep = SourceSeparation(args.sep_method, device=device, ckpt_path=args.ckpt, arch=args.arch) if do_sep else None
 
     ###########################################
     ###### BEATS loading
@@ -162,6 +162,7 @@ if __name__ == "__main__":
     parser.add_argument('-sep', '--do_sep', type=str2bool, default=True, help="Enable source separation. Use True or False.")
     parser.add_argument('-sepmethod', '--sep_method', type=str, default="music", choices=["music", "env", "nbss"], help="Source separation method. Defaults to 'music'.")
     parser.add_argument('-ckpt', '--ckpt', type=str, default=None, help="Checkpoint (.ckpt) for --sep_method nbss.")
+    parser.add_argument('--arch', type=str, default="retention", choices=["retention", "mamba"], help="Architektur des nbss-Checkpoints. Defaults to 'retention'.")
     args = parser.parse_args()
 
     anonymize_audio(args)

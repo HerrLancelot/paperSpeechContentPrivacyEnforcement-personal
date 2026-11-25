@@ -402,7 +402,7 @@ def blurring_mfcc(audio, sr, n_mfcc=5):
     return audio_reconstructed
 
 class SourceSeparation:
-    def __init__(self, method="music", device="cpu", ckpt_path=None):
+    def __init__(self, method="music", device="cpu", ckpt_path=None, arch="retention"):
         """
         Initialize the SourceSeparation class.
 
@@ -418,7 +418,7 @@ class SourceSeparation:
             from nbss_separator import NBSSSeparator
             if ckpt_path is None:
                 raise ValueError("method 'nbss' needs ckpt_path")
-            self.model = NBSSSeparator(ckpt_path, device=device)
+            self.model = NBSSSeparator(ckpt_path, device=device, arch=arch)
             self.sr = self.model.sr
             self.device = device
             return

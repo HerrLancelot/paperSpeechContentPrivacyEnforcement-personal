@@ -60,7 +60,7 @@ def main(a):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda" and a.gpu_frac:
         torch.cuda.set_per_process_memory_fraction(a.gpu_frac)
-    sep = NBSSSeparator(a.ckpt, device)
+    sep = NBSSSeparator(a.ckpt, device, arch=a.arch)
 
     files = sorted(glob.glob(os.path.join(a.scad_dir, "**", "*_mixture.wav"), recursive=True))
     assert files, f"keine *_mixture.wav unter {a.scad_dir}"
@@ -135,5 +135,6 @@ if __name__ == "__main__":
     p.add_argument("--win", type=float, default=1.0, help="Fensterlaenge GCC-PHAT in s")
     p.add_argument("--max-lag", type=int, default=8, help="max. Lag in Samples (Arraygroesse beachten)")
     p.add_argument("--batch-roll", action="store_true", help="Rollungen als Batch (benoetigt separate_batch)")
+    p.add_argument("--arch", choices=["retention", "mamba"], default="retention", help="Architektur des Checkpoints")
     p.add_argument("--gpu-frac", type=float, default=0.25)
     main(p.parse_args())
